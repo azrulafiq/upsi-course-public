@@ -28,12 +28,6 @@ They're plain Markdown — readable on GitHub, in a text editor, or any Markdown
 
 Stuck? Flag it during the session so you can pair with a neighbour while it's fixed.
 
+## Cheat sheet
 
-
-docker run -d --name db --network wpnet -v dbdata:/var/lib/mysql \
-  -e MARIADB_ROOT_PASSWORD=rootpass -e MARIADB_DATABASE=wordpress \
-  -e MARIADB_USER=wp -e MARIADB_PASSWORD=wppass mariadb:latest
-
-docker run -d --name wp --network wpnet -p 8088:80 \
-  -e WORDPRESS_DB_HOST=db -e WORDPRESS_DB_NAME=wordpress \
-  -e WORDPRESS_DB_USER=wp -e WORDPRESS_DB_PASSWORD=wppass wordpress:latest
+- **[Cheat-Sheet.md](Cheat-Sheet.md)** — every Docker, kubectl, gcloud, Terraform, and Ansible command used across both days, with a one-line explanation each, plus a worked Docker networking/volume example and a troubleshooting quick reference.

@@ -19,6 +19,8 @@ Reboot when prompted. Ubuntu opens and asks you to create a Linux username + pas
 
 ## Step 2 — Docker Desktop
 
+Or access here for more options: https://docs.docker.com/engine/install/ubuntu/
+
 1. Download from docker.com/products/docker-desktop and install (choose the WSL 2 backend).
 2. Start Docker Desktop → **Settings → Resources → WSL Integration** → enable for **Ubuntu** → Apply & Restart.
 3. Verify — in an **Ubuntu (WSL) terminal**:

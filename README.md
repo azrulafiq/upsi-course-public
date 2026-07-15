@@ -27,3 +27,9 @@ They're plain Markdown — readable on GitHub, in a text editor, or any Markdown
 - Each lab ends with a "✅ Done when..." checkpoint — use it to confirm you're on track before moving on.
 
 Stuck? Flag it during the session so you can pair with a neighbour while it's fixed.
+
+
+
+docker run -d --name db --network wpnet -v dbdata:/var/lib/mysql \
+  -e MARIADB_ROOT_PASSWORD=rootpass -e MARIADB_DATABASE=wordpress \
+  -e MARIADB_USER=wp -e MARIADB_PASSWORD=wppass mariadb:latest

@@ -3,62 +3,100 @@
 
 **Straightcut IT Solution — Instructor-led Technical Training**
 
-Same WSL terminal as yesterday; today it talks to Google Cloud. Conventions: `userNN` = your ID, `groupNN` = your assigned Lab 2/3 group (on the board). Project `acserver-497017`, zone `asia-southeast1-a`.
+One shared VM — the **jumphost** — is today's entire toolchain: gcloud, kubectl, docker, terraform, and ansible are already installed. SSH in with the same key as yesterday, username `upsiNN` (that login is separate from your GCP identity — more in Lab 0.2). Collect `userNN-key.json` from the instructor (USB/DM) if you don't already have it; you'll activate it once you're in. Conventions: `upsiNN` = your SSH login, `userNN` = your GCP identity (same number, different name — say it out loud once so it sticks), `groupNN` = your assigned Lab 2/3 group (on the board). Project `acserver-497017`, zone `asia-southeast1-a`.
 
 | What | Address |
 |---|---|
+| Jumphost | `ssh -i <private key> upsiNN@<jumphost-ip>` (IP on the board) |
 | Your app (after Lab 1) | `http://userNN.gkecluster.eunoai.my` |
 | Shared cluster | `training-cluster` — one for the class, a namespace each |
 
 ---
 
-# Lab 0 — Log in and look around (20 min)
+# Lab 0 — Get on the jumphost, sign in as yourself (20 min)
 
-If you ran last night's three commands, steps 0.1–0.2 are a victory lap.
-
-### 0.1 Authenticate as your service account
+### 0.1 SSH in
 
 ```bash
+ssh -i <path-to-your-private-key> upsiNN@<jumphost-ip>
+```
+
+Same private key as yesterday, new host — yesterday's VM is gone, the jumphost is everyone's machine today. First login creates your `upsiNN` account automatically, passwordless sudo included, same as Day 1.
+
+### 0.2 Bring your GCP identity onto the box
+
+The jumphost is shared, but nothing about your session is — separate `upsiNN` accounts mean separate home directories, separate `gcloud`/`docker` configs. From **your own laptop's terminal**:
+
+```bash
+scp -i <path-to-your-private-key> userNN-key.json upsiNN@<jumphost-ip>:~
+```
+
+Back on the jumphost:
+
+```bash
+chmod 600 ~/userNN-key.json          # lock it down — you're not the only account on this box
 gcloud auth activate-service-account --key-file=~/userNN-key.json
 gcloud config set project acserver-497017
 gcloud config set compute/zone asia-southeast1-a
-gcloud auth list                  # your SA has the * (active)
+gcloud auth configure-docker asia-southeast1-docker.pkg.dev --quiet
+gcloud auth list                     # userNN-sa marked active — your session, nobody else's
 ```
 
-### 0.2 Meet today's cast
+### 0.3 Confirm the toolchain
+
+```bash
+gcloud --version | head -1
+kubectl version --client
+docker --version
+terraform version | head -1
+ansible --version | head -1
+```
+
+### 0.4 Meet today's cast
 
 ```bash
 gcloud compute instances list     # the class VMs (your group's target arrives in Lab 2)
 gcloud container clusters list    # training-cluster — built by Terraform, as you'll see
 ```
 
-### 0.3 One-time: authorize Docker for the registry
-
-```bash
-gcloud auth configure-docker asia-southeast1-docker.pkg.dev
-```
-
-✅ **Done when:** your SA is active and configure-docker reports the registry added.
+✅ **Done when:** all five tools print a version, `userNN-sa` shows active, and `training-cluster` is listed.
 
 ---
 
-# Lab 1 — Ship it: registry → GKE → real hostname (60 min)
+# Lab 1 — Ship it: your Day 1 image → GKE → real hostname (60 min)
 
-### 1.1 Push yesterday's image to Artifact Registry
+### 1.1 Get yesterday's image onto the jumphost
 
-The registry address decodes as `REGION-docker.pkg.dev / PROJECT / REPO / IMAGE : TAG`:
+You `scp`'d `hello-web.tar` down to your laptop before Day 1's VM was destroyed. Now the reverse hop, from **your own laptop's terminal**:
 
 ```bash
-docker tag hello-web:v1 \
-  asia-southeast1-docker.pkg.dev/acserver-497017/labs/userNN/hello-web:v1
+scp -i <path-to-your-private-key> hello-web.tar upsiNN@<jumphost-ip>:~
+```
+
+Back on the jumphost:
+
+```bash
+docker load -i hello-web.tar
+docker images | grep hello-web     # hello-web:upsiNN-v2, restored
+```
+
+### 1.2 Push it to Artifact Registry
+
+The registry address decodes as `REGION-docker.pkg.dev / PROJECT / REPO / IMAGE : TAG`. `docker load` only restores the image *locally* — GKE can't reach into your Docker daemon the way minikube could yesterday; it only ever pulls from a registry:
+
+```bash
+docker tag hello-web:upsiNN-v2 \
+  asia-southeast1-docker.pkg.dev/acserver-497017/labs/userNN/hello-web:v2
 docker push \
-  asia-southeast1-docker.pkg.dev/acserver-497017/labs/userNN/hello-web:v1
+  asia-southeast1-docker.pkg.dev/acserver-497017/labs/userNN/hello-web:v2
 
 gcloud artifacts docker images list \
   asia-southeast1-docker.pkg.dev/acserver-497017/labs/userNN
 ```
 
-### 1.2 Connect to the shared cluster & claim your namespace
+(The local image tag still says `upsiNN` from yesterday — that's just a local label, fine to leave. The registry *path*, `labs/userNN/...`, is what matters here: it's tied to your `userNN-sa` push permission from Lab 0.2.)
+
+### 1.3 Connect to the shared cluster & claim your namespace
 
 ```bash
 gcloud container clusters get-credentials training-cluster --zone asia-southeast1-a
@@ -69,7 +107,7 @@ kubectl config set-context --current --namespace=userNN
 
 One cluster for the whole class — your namespace is your room in it. **House rule #1: stay in yours.**
 
-### 1.3 The manifests — yesterday's, plus two additions
+### 1.4 The manifests — yesterday's, plus two additions
 
 ```bash
 mkdir ~/gke && cd ~/gke
@@ -94,7 +132,7 @@ spec:
     spec:
       containers:
       - name: hello-web
-        image: asia-southeast1-docker.pkg.dev/acserver-497017/labs/userNN/hello-web:v1
+        image: asia-southeast1-docker.pkg.dev/acserver-497017/labs/userNN/hello-web:v2
         ports:
         - containerPort: 8080
         resources:
@@ -144,7 +182,7 @@ spec:
               number: 80
 ```
 
-### 1.4 Deploy and go public
+### 1.5 Deploy and go public
 
 ```bash
 kubectl apply -f .
@@ -154,7 +192,7 @@ kubectl get ingress             # your host + the shared class IP
 
 Open **`http://userNN.gkecluster.eunoai.my`** — in your laptop's browser, your phone, anywhere. That's a real URL on the public internet, and it's yours for the rest of the course.
 
-### 1.5 Same tricks, bigger stage
+### 1.6 Same tricks, bigger stage
 
 ```bash
 kubectl scale deployment hello-web --replicas=4
@@ -162,17 +200,15 @@ kubectl delete pod <one>        # self-heal, cloud edition
 kubectl top pods                # your actual usage vs your 50m request
 ```
 
-**Stretch (5 min, do it if you're ahead):** push your `hello-web:v2` from yesterday and roll it out here — `kubectl set image deployment/hello-web hello-web=...:v2` — the exact Lab 4 motion, now behind a public hostname.
-
 ✅ **Done when:** `userNN.gkecluster.eunoai.my` serves your app from 4 self-healing pods.
 
-**If stuck:** `ImagePullBackOff` → wrong `userNN` in the image path. Hostname won't load → typo in the ingress host, or check `kubectl get ingress`. Anything weird → `kubectl describe pod`, read Events.
+**If stuck:** `ImagePullBackOff` → wrong `userNN` in the image path, or you skipped 1.2's push. Hostname won't load → typo in the ingress host, or check `kubectl get ingress`. Anything weird → `kubectl describe pod`, read Events.
 
 ---
 
 # Lab 2 — Provision infrastructure from code (50 min · assigned groups)
 
-**Where:** the group driver's WSL terminal (swap drivers for Lab 3!).
+**Where:** the jumphost — one group member's SSH session drives, everyone else watches over their shoulder (swap who's driving for Lab 3!). Whoever drives runs this in their own `upsiNN` home directory, authenticated as their own `userNN-sa` from Lab 0.2 — that's whose `.tf` files and state this ends up in.
 
 ### 2.1 The files
 
@@ -261,7 +297,7 @@ terraform plan      # "No changes." — reality matches code
 
 # Lab 3 — Capstone: blank VM → running app, hands off (50 min · same groups, new driver)
 
-The target has no public IP, so we travel through **IAP** (Identity-Aware Proxy) — Google's front door to private machines. Your service account already has the permission.
+The target has no public IP, so we travel through **IAP** (Identity-Aware Proxy) — Google's front door to private machines. Your `userNN-sa` already has the permission, granted in `iam.tf` alongside Lab 2's.
 
 ### 3.1 Seed SSH once, through the tunnel
 
@@ -300,7 +336,7 @@ host_key_checking = False
 ansible web -m ping     # green "pong" = Ansible can drive the machine
 ```
 
-**`site.yml`** (replace `userNN` — use the driver's image):
+**`site.yml`** (replace `userNN` — use the driver's image from Lab 1):
 
 ```yaml
 - name: Turn a blank VM into a Docker host running my app
@@ -329,7 +365,7 @@ ansible web -m ping     # green "pong" = Ansible can drive the machine
     - name: Run the hello-web container
       community.docker.docker_container:
         name: hello-web
-        image: asia-southeast1-docker.pkg.dev/acserver-497017/labs/userNN/hello-web:v1
+        image: asia-southeast1-docker.pkg.dev/acserver-497017/labs/userNN/hello-web:v2
         ports: ["80:8080"]
         restart_policy: always
         state: started
@@ -376,8 +412,8 @@ Missions live in the **Challenge Labs handout** — goals and proof conditions o
 
 | Symptom | First move |
 |---|---|
-| gcloud "permission denied" | `gcloud auth list` — right SA active? |
-| Push denied | Wrong `userNN` in the path, or re-run configure-docker |
+| gcloud "permission denied" | `gcloud auth list` — is your own `userNN-sa` active? (Lab 0.2) |
+| Push denied | Wrong `userNN` in the path, or Lab 0.2's key never got activated |
 | Pod stuck | `kubectl describe pod` → Events |
 | Hostname won't load | `kubectl get ingress` — host listed? `userNN` typo? |
 | Terraform plans a surprise destroy | **Stop.** Ask the instructor |

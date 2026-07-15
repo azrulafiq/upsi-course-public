@@ -3,14 +3,14 @@
 
 **Straightcut IT Solution — Instructor-led Technical Training**
 
-Everything today runs in **your own WSL Ubuntu terminal** with Docker Desktop. No cloud, no accounts, no keys, nothing you can break that `minikube delete` won't fix. Replace `userNN` with your assigned ID wherever you see it.
+Everything today runs on **your own cloud VM** — Docker, kubectl, and minikube are already installed; you connect over SSH with a key the instructor gives you. Nothing you can break that `minikube delete` (or a full VM rebuild) won't fix. Replace `upsiNN` with your assigned ID wherever you see it.
 
 ---
 
 # Lab 0 — Toolkit check (15 min)
 
 ```bash
-docker version --format 'Docker {{.Server.Version}}'   # Docker Desktop must be running
+docker version --format 'Docker {{.Server.Version}}'   # Docker daemon must be running
 minikube version | head -1
 kubectl version --client
 ```
@@ -25,7 +25,7 @@ docker run hello-world
 
 ✅ **Done when:** three version numbers + you can explain hello-world's four steps in your own words.
 
-Laptop misbehaving? Flag it **now** and pair with a neighbour while we fix it.
+VM misbehaving? Flag it **now** and pair with a neighbour while we fix it.
 
 ---
 
@@ -50,7 +50,7 @@ docker stop web && docker rm web
 mkdir ~/hello-web && cd ~/hello-web
 ```
 
-**`app.py`** (set `userNN` to your ID):
+**`app.py`** (set `upsiNN` to your ID):
 
 ```python
 from flask import Flask
@@ -61,7 +61,7 @@ app = Flask(__name__)
 @app.route("/")
 def hello():
     return (
-        f"<h1>Hello from {os.environ.get('OWNER', 'userNN')}!</h1>"
+        f"<h1>Hello from {os.environ.get('OWNER', 'upsiNN')}!</h1>"
         f"<p>Served by container: <b>{socket.gethostname()}</b></p>"
         f"<p>Version: v1</p>"
     )
@@ -76,7 +76,7 @@ if __name__ == "__main__":
 flask==3.0.3
 ```
 
-**`Dockerfile`** (set `userNN`):
+**`Dockerfile`** (set `upsiNN`):
 
 ```dockerfile
 FROM python:3.12-slim
@@ -85,7 +85,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 EXPOSE 8080
-ENV OWNER=userNN
+ENV OWNER=upsiNN
 CMD ["python", "app.py"]
 ```
 
@@ -190,26 +190,36 @@ minikube start --driver=docker     # 1–2 min; it's a full cluster inside Docke
 kubectl get nodes                  # NAME: minikube   STATUS: Ready
 ```
 
-### 3.2 Hand it your image
+### 3.2 Make it yours
 
-Kubernetes treats the `:latest` tag specially (it always tries to pull), so give your image a real tag first:
+Today's cluster is personal, but tomorrow's Day 2 cluster is **shared** — every student's `hello-web:v1` would land on the exact same cluster under the exact same name and silently overwrite each other's deployment. Bake your username into the tag now, before that's a problem:
 
 ```bash
-docker tag hello-web hello-web:v1
-minikube image load hello-web:v1   # ~30s: copies the image into the cluster
+docker tag hello-web hello-web:upsiNN-v1     # swap upsiNN for your real ID
+docker images | grep hello-web               # both tags listed, same IMAGE ID
 ```
 
-### 3.3 Run it
+`docker tag` doesn't copy anything — it just adds a second label pointing at the same image layers. From here on, every command uses that personalized tag, not the bare `hello-web`.
+
+### 3.3 Hand it your image
+
+Kubernetes treats the `:latest` tag specially (it always tries to pull) — good thing you already have a real one:
 
 ```bash
-kubectl create deployment hello-web --image=hello-web:v1
+minikube image load hello-web:upsiNN-v1   # ~30s: copies the image into the cluster
+```
+
+### 3.4 Run it
+
+```bash
+kubectl create deployment hello-web --image=hello-web:upsiNN-v1
 kubectl get pods                   # 1 pod, Running
 kubectl port-forward deployment/hello-web 8080:8080
 ```
 
-In a **second WSL terminal**: `curl localhost:8080` — your app, served by Kubernetes. Ctrl-C the port-forward when done looking.
+In a **second terminal**: `curl localhost:8080` — your app, served by Kubernetes. Ctrl-C the port-forward when done looking.
 
-### 3.4 Scale, then vandalize
+### 3.5 Scale, then vandalize
 
 ```bash
 kubectl scale deployment hello-web --replicas=4
@@ -218,7 +228,7 @@ kubectl delete pod <pick-one>
 kubectl get pods                   # the replacement is already starting
 ```
 
-### 3.5 The twin ritual
+### 3.6 The twin ritual
 
 Yesterday's Docker ritual has an exact Kubernetes twin — practise it on a pod:
 
@@ -263,7 +273,7 @@ spec:
     spec:
       containers:
       - name: hello-web
-        image: hello-web:v1
+        image: hello-web:upsiNN-v1     # your tag from Lab 3.2, not the bare one
         ports:
         - containerPort: 8080
 ```
@@ -295,14 +305,14 @@ kubectl port-forward service/hello-web 8080:80
 ```bash
 cd ~/hello-web
 # edit app.py: change the version line to v2
-docker build -t hello-web:v2 .
-minikube image load hello-web:v2
+docker build -t hello-web:upsiNN-v2 .
+minikube image load hello-web:upsiNN-v2
 ```
 
 Open a terminal with `kubectl get pods -w` running, then:
 
 ```bash
-kubectl set image deployment/hello-web hello-web=hello-web:v2
+kubectl set image deployment/hello-web hello-web=hello-web:upsiNN-v2
 ```
 
 Watch the waves: new pods start, old pods drain, traffic never stops. Refresh your curl: **v2**.
@@ -319,18 +329,52 @@ kubectl rollout undo deployment/hello-web      # ...and forward again -> v2
 
 ---
 
-# Before you leave — 3 commands for tomorrow (5 min)
+# Before you leave — get your image off this VM (10 min)
 
-Collect your `userNN-key.json` from the instructor, save it in your WSL home directory, then:
+Tomorrow this VM is gone — `terraform destroy` doesn't ask twice. Everything you built today (`hello-web:upsiNN-v1`, `upsiNN-v2`) exists in exactly one place: this Docker daemon, on this one disk. **This is the exact problem image registries exist to solve.** You'll feel the problem by hand first; tomorrow you'll meet the fix.
+
+### 1. Package the image, not just the container
 
 ```bash
-gcloud auth activate-service-account --key-file=~/userNN-key.json
-gcloud config set project acserver-497017
-gcloud config set compute/zone asia-southeast1-a
-gcloud auth list       # your SA marked active = you're ready for 8:30
+cd ~
+docker save -o hello-web.tar hello-web:upsiNN-v2
+ls -lh hello-web.tar        # a few hundred MB — every layer, baked into one file
 ```
 
-A working login tonight = a running start tomorrow. **Guard the key file; never commit it to Git.**
+`docker save` captures the whole *image*: layers, tags, and the `CMD`/`ENV` metadata that make it runnable. There's a similarly-named pair — `docker export` / `docker import` — that works on a *container's* filesystem instead: it flattens everything into one layer and throws away `CMD`, `ENV`, `EXPOSE` in the process. Use `save`, not `export`, or the image that comes back tomorrow won't know how to start itself.
+
+### 2. Pull it down to your own laptop
+
+Run this from **your own laptop's terminal**, not the VM — this direction only works pulling *from* the VM to somewhere that survives after it:
+
+```bash
+scp -i <path-to-your-private-key> upsiNN@<vm-external-ip>:~/hello-web.tar .
+```
+
+That file landing on your own disk is the only proof this image survives past today.
+
+### 3. Confirm it's real
+
+```bash
+tar -tvf hello-web.tar | head -5     # peek inside — no Docker daemon needed for this part
+```
+
+You should see `manifest.json` and a handful of layer directories: your whole image, sitting in one file.
+
+**Watch for:** `docker export`/`import` instead of `save`/`load` (loses `CMD` — the image boots into nothing); dropping the tag on `docker save hello-web` — that resolves to `hello-web:latest`, not the personalized `upsiNN-v2` you actually built (run `docker images` first and copy the exact tag); running `scp` *from* the VM instead of your laptop (wrong direction — nothing to push yet).
+
+✅ **Done when:** `hello-web.tar` sits on your own laptop, and you can say out loud why `docker save`, not `docker export`, is the one that keeps the image runnable.
+
+*Tomorrow: `docker load` this same tar on the Day 2 jumphost, then `docker tag` + `docker push` it to Artifact Registry — GKE can't reach into your Docker daemon the way minikube could, it only ever pulls from a registry. Load alone isn't enough; that push step is Lab 1.*
+
+---
+
+# Before you leave
+
+Bring the same private key tomorrow — the Day 2 jumphost is a shared machine, already set up with gcloud/kubectl/docker/terraform/ansible, so there's nothing to install tonight. Two things to leave with:
+
+- **`hello-web.tar`** on your own laptop (from above).
+- **`userNN-key.json`** from the instructor (USB/DM) — this is your personal GCP identity for tomorrow, separate from tonight's `upsiNN` SSH login. You'll activate it once on the jumphost (Lab 0.2); nothing to do with it tonight except not lose it. **Guard it; never commit it to Git.**
 
 ---
 
@@ -338,7 +382,7 @@ A working login tonight = a running start tomorrow. **Guard the key file; never 
 
 | Symptom | First move |
 |---|---|
-| Docker errors in WSL | Is Docker Desktop running, with WSL integration on? |
+| Docker errors | Is the Docker daemon running? `sudo systemctl status docker` |
 | Build fails | Read the error — it names the line and usually the file |
 | Container exits instantly | `docker ps -a` for the exit code, then `docker logs` |
 | minikube start fails | `minikube delete && minikube start --driver=docker` |

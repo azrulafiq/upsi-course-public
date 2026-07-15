@@ -49,6 +49,8 @@ EOF
 
 sudo apt update
 
+sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
 
 sudo apt-get update && sudo apt-get install -y git curl gnupg apt-transport-https ca-certificates lsb-release software-properties-common
 

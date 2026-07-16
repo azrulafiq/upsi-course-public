@@ -204,22 +204,79 @@ provider "proxmox" {
 
 ### 5.3 `variables.tf`
 
-```hcl
-variable "pve_endpoint"  { type = string }
-variable "pve_api_token" { type = string, sensitive = true }
-variable "pve_node"      { type = string, default = "pve01" }
-variable "pve_node_ip"   { type = string }
-variable "pve_ssh_key"   { type = string, default = "~/.ssh/id_ed25519" }
+> **HCL note:** arguments inside a block are newline-separated, never comma-separated.
+> `variable "x" { type = string, default = "y" }` will not parse.
 
-variable "vm_storage"      { type = string, default = "local-lvm" }
-variable "snippet_storage" { type = string, default = "local" }
-variable "bridge"          { type = string, default = "vmbr0" }
-variable "gateway"         { type = string, default = "10.10.10.1" }
-variable "nameserver"      { type = string, default = "10.10.10.1" }
-variable "ssh_public_key"  { type = string }
+```hcl
+# --- Proxmox connection (no defaults — set these in terraform.tfvars) ---
+
+variable "pve_endpoint" {
+  description = "Proxmox API endpoint, e.g. https://pve01.lab.local:8006/"
+  type        = string
+}
+
+variable "pve_api_token" {
+  description = "Format: terraform@pve!tfprovider=<uuid>"
+  type        = string
+  sensitive   = true
+}
+
+variable "pve_node" {
+  description = "Proxmox node name as shown in the GUI"
+  type        = string
+  default     = "pve01"
+}
+
+variable "pve_node_ip" {
+  description = "IP the provider SSHes to for cloud-image import"
+  type        = string
+}
+
+variable "pve_ssh_key" {
+  type    = string
+  default = "~/.ssh/id_ed25519"
+}
+
+# --- Infrastructure ---
+
+variable "vm_storage" {
+  type    = string
+  default = "local-lvm"
+}
+
+variable "snippet_storage" {
+  type    = string
+  default = "local"
+}
+
+variable "bridge" {
+  type    = string
+  default = "vmbr0"
+}
+
+variable "gateway" {
+  type    = string
+  default = "10.10.10.1"
+}
+
+variable "nameserver" {
+  type    = string
+  default = "10.10.10.1"
+}
+
+variable "ssh_public_key" {
+  description = "Injected into the ubuntu user on every node"
+  type        = string
+}
+
+# Note: commas ARE valid inside object({...}) type constraints and inside map
+# values. They are only invalid between the arguments of a block.
 
 variable "control_planes" {
-  type = map(object({ vmid = number, ip = string }))
+  type = map(object({
+    vmid = number
+    ip   = string
+  }))
   default = {
     "k8s-cp-01" = { vmid = 9011, ip = "10.10.10.11/24" }
     "k8s-cp-02" = { vmid = 9012, ip = "10.10.10.12/24" }
@@ -228,7 +285,10 @@ variable "control_planes" {
 }
 
 variable "workers" {
-  type = map(object({ vmid = number, ip = string }))
+  type = map(object({
+    vmid = number
+    ip   = string
+  }))
   default = {
     "k8s-wk-01" = { vmid = 9021, ip = "10.10.10.21/24" }
     "k8s-wk-02" = { vmid = 9022, ip = "10.10.10.22/24" }
@@ -388,7 +448,43 @@ output "worker_ips" {
 }
 ```
 
-### 5.7 Apply
+### 5.7 `terraform.tfvars` — where the values actually come from
+
+Variables are *declared* in `variables.tf` and *assigned* here. Anything without a
+`default` must be set, or `terraform plan` will prompt you interactively.
+
+```hcl
+# terraform/terraform.tfvars   <-- add to .gitignore
+
+pve_endpoint = "https://10.10.10.5:8006/"
+pve_node     = "pve01"
+pve_node_ip  = "10.10.10.5"
+pve_ssh_key  = "~/.ssh/id_ed25519"
+
+vm_storage      = "local-lvm"
+snippet_storage = "local"
+bridge          = "vmbr0"
+gateway         = "10.10.10.1"
+nameserver      = "10.10.10.1"
+
+# pve_api_token and ssh_public_key are NOT here on purpose — see below.
+```
+
+Resolution order (later wins): defaults in `variables.tf` → `terraform.tfvars` →
+`*.auto.tfvars` → `TF_VAR_*` env vars → `-var` on the CLI.
+
+Keep the secret out of the file:
+
+```bash
+cat >> .gitignore <<'EOF'
+terraform.tfvars
+*.auto.tfvars
+.terraform/
+*.tfstate*
+EOF
+```
+
+### 5.8 Apply
 
 ```bash
 cd terraform

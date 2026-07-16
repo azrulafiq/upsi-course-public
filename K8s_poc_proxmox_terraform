@@ -1,0 +1,806 @@
+# Kubernetes PoC on Proxmox VE — 3 Control Plane / 5 Worker
+
+Provisioning with Terraform (`bpg/proxmox`), bootstrapping with `kubeadm` via Ansible.
+Target: a throwaway-but-realistic HA cluster for testing workloads, upgrades, and failure scenarios.
+
+---
+
+## 1. Architecture
+
+```
+                    ┌──────────────────────┐
+                    │  VIP 10.10.10.100    │  ← kube-vip (ARP mode)
+                    │  :6443 control plane │
+                    └──────────┬───────────┘
+                               │
+        ┌──────────────┬───────┴───────┬──────────────┐
+        │              │               │              │
+   ┌────▼────┐    ┌────▼────┐    ┌────▼────┐
+   │ cp-01   │    │ cp-02   │    │ cp-03   │     etcd stacked (quorum = 2)
+   │ .11     │    │ .12     │    │ .13     │
+   └─────────┘    └─────────┘    └─────────┘
+
+   ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
+   │ wk-01   │ │ wk-02   │ │ wk-03   │ │ wk-04   │ │ wk-05   │
+   │ .21     │ │ .22     │ │ .23     │ │ .24     │ │ .25     │
+   └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘
+```
+
+| Component | Choice | Why |
+|---|---|---|
+| Provider | `bpg/proxmox` | Actively maintained; `Telmate/proxmox` is effectively abandoned |
+| Guest OS | Ubuntu 24.04 LTS cloud image | cloud-init native, well-tested with kubeadm |
+| Runtime | containerd 1.7+ | dockershim is long gone |
+| Bootstrap | kubeadm + Ansible | Terraform makes VMs, Ansible makes a cluster — don't mix them |
+| CP VIP | kube-vip (static pod, ARP) | No extra VMs vs. HAProxy+keepalived pair |
+| CNI | Cilium | eBPF, kube-proxy replacement optional, good observability for a PoC |
+| LB | MetalLB (L2) | Gives `type: LoadBalancer` on bare Proxmox |
+| Storage | local-path (default) + optional NFS CSI | Keeps PoC simple |
+
+---
+
+## 2. Requirements
+
+### 2.1 Proxmox host sizing
+
+| Role | Count | vCPU | RAM | Disk |
+|---|---|---|---|---|
+| Control plane | 3 | 2 | 4 GB | 40 GB |
+| Worker | 5 | 4 | 8 GB | 60 GB |
+| **Total (guests)** | **8** | **26** | **52 GB** | **420 GB** |
+
+Host minimum: **16 physical cores / 64 GB RAM / 500 GB SSD or NVMe**.
+Spinning rust will make etcd unhappy — `etcd_disk_wal_fsync_duration_seconds` will spike and you'll get spurious leader elections. Use SSD/NVMe for the VM storage pool.
+
+CPU overcommit at 26 vCPU on 16 cores is fine for a PoC. RAM is **not** overcommittable here — don't rely on ballooning for etcd nodes.
+
+### 2.2 Software
+
+| Tool | Version |
+|---|---|
+| Proxmox VE | 8.2+ |
+| Terraform | 1.9+ (or OpenTofu 1.8+) |
+| Ansible | 2.16+ |
+| kubectl / kubeadm / kubelet | 1.31.x |
+| Helm | 3.15+ |
+
+### 2.3 Network plan
+
+| Item | Value |
+|---|---|
+| VM subnet | `10.10.10.0/24` (vmbr0) |
+| Gateway | `10.10.10.1` |
+| Control plane VIP | `10.10.10.100` |
+| CP nodes | `10.10.10.11-13` |
+| Workers | `10.10.10.21-25` |
+| MetalLB pool | `10.10.10.200-10.10.10.240` |
+| Pod CIDR | `10.244.0.0/16` |
+| Service CIDR | `10.96.0.0/12` |
+
+The VIP and MetalLB pool must be **outside** your DHCP scope. Pod/Service CIDRs must not overlap the VM subnet.
+
+### 2.4 Prerequisites checklist
+
+- [ ] Proxmox node reachable, `pveversion` ≥ 8.2
+- [ ] Storage pool for VM disks (`local-lvm` / `local-zfs`) with 500 GB free
+- [ ] Storage pool that accepts `snippets` and `import` content types (usually `local`)
+- [ ] Bridge `vmbr0` on the VM VLAN
+- [ ] API token created (see below)
+- [ ] SSH keypair for the `ubuntu` user
+- [ ] Nested virtualisation **not** required, but `cpu type = host` is
+
+---
+
+## 3. Proxmox prep
+
+### 3.1 API token
+
+```bash
+# On the Proxmox host
+pveum user add terraform@pve
+pveum role add TerraformRole -privs \
+  "Datastore.Allocate Datastore.AllocateSpace Datastore.Audit \
+   Pool.Allocate Sys.Audit Sys.Console Sys.Modify \
+   VM.Allocate VM.Audit VM.Clone VM.Config.CDROM VM.Config.Cloudinit \
+   VM.Config.CPU VM.Config.Disk VM.Config.HWType VM.Config.Memory \
+   VM.Config.Network VM.Config.Options VM.Migrate VM.Monitor \
+   VM.PowerMgmt SDN.Use"
+pveum aclmod / -user terraform@pve -role TerraformRole
+pveum user token add terraform@pve tfprovider --privsep=0
+```
+
+Copy the token value — it's shown once.
+
+### 3.2 Enable snippets on `local`
+
+```bash
+pvesm set local --content backup,iso,vztmpl,snippets,import
+```
+
+### 3.3 Allow the provider to SSH (needed for cloud-image import)
+
+`bpg/proxmox` shells into the node for some operations. Either use `root@pam` for the SSH block or:
+
+```bash
+useradd -m -s /bin/bash terraform
+usermod -aG sudo terraform
+echo "terraform ALL=(root) NOPASSWD: /sbin/pvesm, /usr/bin/qm, /sbin/qmrestore" \
+  > /etc/sudoers.d/terraform
+mkdir -p /home/terraform/.ssh && chmod 700 /home/terraform/.ssh
+# paste your pubkey into /home/terraform/.ssh/authorized_keys
+```
+
+---
+
+## 4. Repo layout
+
+```
+k8s-poc/
+├── terraform/
+│   ├── versions.tf
+│   ├── providers.tf
+│   ├── variables.tf
+│   ├── image.tf
+│   ├── nodes.tf
+│   ├── outputs.tf
+│   └── terraform.tfvars        # gitignored
+├── ansible/
+│   ├── inventory.ini           # generated by terraform
+│   ├── ansible.cfg
+│   ├── site.yml
+│   └── roles/
+│       ├── common/
+│       ├── containerd/
+│       ├── kubeadm/
+│       ├── control-plane-init/
+│       └── join/
+└── manifests/
+    ├── cilium-values.yaml
+    └── metallb-pool.yaml
+```
+
+---
+
+## 5. Terraform
+
+### 5.1 `versions.tf`
+
+```hcl
+terraform {
+  required_version = ">= 1.9.0"
+
+  required_providers {
+    proxmox = {
+      source  = "bpg/proxmox"
+      version = "~> 0.66"   # check registry for latest before pinning
+    }
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.5"
+    }
+  }
+}
+```
+
+### 5.2 `providers.tf`
+
+```hcl
+provider "proxmox" {
+  endpoint  = var.pve_endpoint          # https://pve01.lab.local:8006/
+  api_token = var.pve_api_token         # terraform@pve!tfprovider=<uuid>
+  insecure  = true                      # self-signed cert on a PoC
+
+  ssh {
+    agent    = false
+    username = "root"
+    private_key = file(var.pve_ssh_key)
+    node {
+      name    = var.pve_node
+      address = var.pve_node_ip
+    }
+  }
+}
+```
+
+### 5.3 `variables.tf`
+
+```hcl
+variable "pve_endpoint"  { type = string }
+variable "pve_api_token" { type = string, sensitive = true }
+variable "pve_node"      { type = string, default = "pve01" }
+variable "pve_node_ip"   { type = string }
+variable "pve_ssh_key"   { type = string, default = "~/.ssh/id_ed25519" }
+
+variable "vm_storage"      { type = string, default = "local-lvm" }
+variable "snippet_storage" { type = string, default = "local" }
+variable "bridge"          { type = string, default = "vmbr0" }
+variable "gateway"         { type = string, default = "10.10.10.1" }
+variable "nameserver"      { type = string, default = "10.10.10.1" }
+variable "ssh_public_key"  { type = string }
+
+variable "control_planes" {
+  type = map(object({ vmid = number, ip = string }))
+  default = {
+    "k8s-cp-01" = { vmid = 9011, ip = "10.10.10.11/24" }
+    "k8s-cp-02" = { vmid = 9012, ip = "10.10.10.12/24" }
+    "k8s-cp-03" = { vmid = 9013, ip = "10.10.10.13/24" }
+  }
+}
+
+variable "workers" {
+  type = map(object({ vmid = number, ip = string }))
+  default = {
+    "k8s-wk-01" = { vmid = 9021, ip = "10.10.10.21/24" }
+    "k8s-wk-02" = { vmid = 9022, ip = "10.10.10.22/24" }
+    "k8s-wk-03" = { vmid = 9023, ip = "10.10.10.23/24" }
+    "k8s-wk-04" = { vmid = 9024, ip = "10.10.10.24/24" }
+    "k8s-wk-05" = { vmid = 9025, ip = "10.10.10.25/24" }
+  }
+}
+```
+
+### 5.4 `image.tf` — pull the cloud image once
+
+```hcl
+resource "proxmox_virtual_environment_download_file" "ubuntu_2404" {
+  content_type = "import"
+  datastore_id = var.snippet_storage
+  node_name    = var.pve_node
+  url          = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+  file_name    = "noble-server-cloudimg-amd64.qcow2"
+  overwrite    = false
+}
+
+resource "proxmox_virtual_environment_file" "vendor_cfg" {
+  content_type = "snippets"
+  datastore_id = var.snippet_storage
+  node_name    = var.pve_node
+
+  source_raw {
+    file_name = "k8s-vendor.yaml"
+    data      = <<-EOT
+      #cloud-config
+      package_update: true
+      package_upgrade: false
+      packages:
+        - qemu-guest-agent
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - gpg
+      runcmd:
+        - systemctl enable --now qemu-guest-agent
+        - swapoff -a
+        - sed -i '/\sswap\s/d' /etc/fstab
+    EOT
+  }
+}
+```
+
+### 5.5 `nodes.tf`
+
+```hcl
+locals {
+  all_nodes = merge(
+    { for k, v in var.control_planes : k => merge(v, { role = "cp",     cores = 2, memory = 4096, disk = 40 }) },
+    { for k, v in var.workers        : k => merge(v, { role = "worker", cores = 4, memory = 8192, disk = 60 }) },
+  )
+}
+
+resource "proxmox_virtual_environment_vm" "node" {
+  for_each = local.all_nodes
+
+  name      = each.key
+  vm_id     = each.value.vmid
+  node_name = var.pve_node
+  tags      = ["k8s", "poc", each.value.role]
+
+  agent { enabled = true }
+
+  cpu {
+    cores = each.value.cores
+    type  = "host"
+  }
+
+  memory {
+    dedicated = each.value.memory
+    floating  = 0          # no ballooning — etcd hates it
+  }
+
+  disk {
+    datastore_id = var.vm_storage
+    import_from  = proxmox_virtual_environment_download_file.ubuntu_2404.id
+    interface    = "scsi0"
+    size         = each.value.disk
+    ssd          = true
+    discard      = "on"
+    iothread     = true
+  }
+
+  network_device {
+    bridge = var.bridge
+    model  = "virtio"
+  }
+
+  operating_system { type = "l26" }
+  scsi_hardware = "virtio-scsi-single"
+
+  initialization {
+    datastore_id      = var.vm_storage
+    vendor_data_file_id = proxmox_virtual_environment_file.vendor_cfg.id
+
+    ip_config {
+      ipv4 {
+        address = each.value.ip
+        gateway = var.gateway
+      }
+    }
+
+    dns { servers = [var.nameserver] }
+
+    user_account {
+      username = "ubuntu"
+      keys     = [trimspace(var.ssh_public_key)]
+    }
+  }
+
+  lifecycle {
+    ignore_changes = [initialization[0].user_account]
+  }
+}
+```
+
+### 5.6 `outputs.tf` — generate the Ansible inventory
+
+```hcl
+resource "local_file" "inventory" {
+  filename        = "${path.module}/../ansible/inventory.ini"
+  file_permission = "0644"
+
+  content = <<-EOT
+    [control_plane]
+    %{for k, v in var.control_planes~}
+    ${k} ansible_host=${split("/", v.ip)[0]}
+    %{endfor~}
+
+    [workers]
+    %{for k, v in var.workers~}
+    ${k} ansible_host=${split("/", v.ip)[0]}
+    %{endfor~}
+
+    [k8s:children]
+    control_plane
+    workers
+
+    [k8s:vars]
+    ansible_user=ubuntu
+    ansible_python_interpreter=/usr/bin/python3
+    control_plane_endpoint=10.10.10.100:6443
+    kube_vip_address=10.10.10.100
+  EOT
+}
+
+output "control_plane_ips" {
+  value = { for k, v in var.control_planes : k => split("/", v.ip)[0] }
+}
+output "worker_ips" {
+  value = { for k, v in var.workers : k => split("/", v.ip)[0] }
+}
+```
+
+### 5.7 Apply
+
+```bash
+cd terraform
+export TF_VAR_pve_api_token='terraform@pve!tfprovider=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+export TF_VAR_ssh_public_key="$(cat ~/.ssh/id_ed25519.pub)"
+
+terraform init
+terraform fmt -recursive
+terraform validate
+terraform plan -out=tfplan
+terraform apply tfplan
+```
+
+Expect ~4–6 minutes. Verify:
+
+```bash
+terraform output
+for i in 11 12 13 21 22 23 24 25; do
+  ssh -o StrictHostKeyChecking=no ubuntu@10.10.10.$i 'hostname -f; free -m | head -2'
+done
+```
+
+---
+
+## 6. Bootstrap with Ansible
+
+### 6.1 Common prep (all nodes)
+
+`ansible/roles/common/tasks/main.yml` essentials:
+
+```yaml
+- name: Disable swap
+  ansible.builtin.command: swapoff -a
+  changed_when: false
+
+- name: Load kernel modules
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+
+- name: Sysctl for k8s
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+  notify: reload sysctl
+
+- name: /etc/hosts entries
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ hostvars[item].ansible_host }} {{ item }}"
+  loop: "{{ groups['k8s'] }}"
+```
+
+### 6.2 containerd
+
+```yaml
+- name: Install containerd
+  ansible.builtin.apt:
+    name: containerd
+    state: present
+    update_cache: true
+
+- name: Default config
+  ansible.builtin.shell: containerd config default > /etc/containerd/config.toml
+  args: { creates: /etc/containerd/config.toml }
+
+- name: Use systemd cgroup driver
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: 'SystemdCgroup = false'
+    replace: 'SystemdCgroup = true'
+  notify: restart containerd
+```
+
+> `SystemdCgroup = true` is the single most common cause of a kubelet that flaps and never goes Ready. Don't skip it.
+
+### 6.3 kubeadm packages
+
+```yaml
+- name: Kubernetes apt key
+  ansible.builtin.get_url:
+    url: https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key
+    dest: /tmp/k8s.key
+
+- name: Dearmor key
+  ansible.builtin.shell: gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg /tmp/k8s.key
+  args: { creates: /etc/apt/keyrings/kubernetes.gpg }
+
+- name: Repo
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /"
+    filename: kubernetes
+
+- name: Install kube packages
+  ansible.builtin.apt:
+    name: [kubelet=1.31.*, kubeadm=1.31.*, kubectl=1.31.*]
+    state: present
+    update_cache: true
+
+- name: Pin versions
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: [kubelet, kubeadm, kubectl]
+```
+
+### 6.4 kube-vip static pod (control plane nodes, before init)
+
+```bash
+# Run on each CP node — generates /etc/kubernetes/manifests/kube-vip.yaml
+export VIP=10.10.10.100
+export INTERFACE=$(ip -4 route show default | awk '{print $5}')
+export KVVERSION=v0.8.7
+
+ctr image pull ghcr.io/kube-vip/kube-vip:$KVVERSION
+ctr run --rm --net-host ghcr.io/kube-vip/kube-vip:$KVVERSION vip \
+  /kube-vip manifest pod \
+  --interface $INTERFACE \
+  --address $VIP \
+  --controlplane \
+  --arp \
+  --leaderElection \
+  | tee /etc/kubernetes/manifests/kube-vip.yaml
+```
+
+On the **first** CP node only, add `super-admin.conf` handling for kube-vip ≥ 0.8:
+
+```bash
+sed -i 's#path: /etc/kubernetes/admin.conf#path: /etc/kubernetes/super-admin.conf#' \
+  /etc/kubernetes/manifests/kube-vip.yaml
+```
+
+Revert it to `admin.conf` after all three CPs have joined.
+
+### 6.5 Init the first control plane
+
+`kubeadm-config.yaml`:
+
+```yaml
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: v1.31.4
+controlPlaneEndpoint: "10.10.10.100:6443"
+networking:
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+apiServer:
+  certSANs:
+    - "10.10.10.100"
+    - "10.10.10.11"
+    - "10.10.10.12"
+    - "10.10.10.13"
+    - "k8s-api.lab.local"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+```
+
+```bash
+sudo kubeadm init --config kubeadm-config.yaml --upload-certs
+```
+
+Save the two join commands it prints. Then:
+
+```bash
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+kubectl get nodes    # NotReady until CNI is installed — expected
+```
+
+### 6.6 Join the other two control planes
+
+```bash
+sudo kubeadm join 10.10.10.100:6443 \
+  --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash> \
+  --control-plane --certificate-key <cert-key>
+```
+
+Certificate key expires after 2 hours. Regenerate:
+
+```bash
+sudo kubeadm init phase upload-certs --upload-certs
+sudo kubeadm token create --print-join-command
+```
+
+### 6.7 Join the 5 workers
+
+```bash
+sudo kubeadm join 10.10.10.100:6443 \
+  --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash>
+```
+
+Ansible-friendly version:
+
+```yaml
+- name: Generate join command
+  ansible.builtin.command: kubeadm token create --print-join-command
+  register: join_cmd
+  delegate_to: "{{ groups['control_plane'][0] }}"
+  run_once: true
+
+- name: Join workers
+  ansible.builtin.command: "{{ join_cmd.stdout }}"
+  args: { creates: /etc/kubernetes/kubelet.conf }
+```
+
+---
+
+## 7. Cluster add-ons
+
+### 7.1 Cilium CNI
+
+```bash
+helm repo add cilium https://helm.cilium.io/
+helm repo update
+
+helm install cilium cilium/cilium --version 1.16.5 \
+  --namespace kube-system \
+  --set ipam.mode=kubernetes \
+  --set k8sServiceHost=10.10.10.100 \
+  --set k8sServicePort=6443 \
+  --set operator.replicas=2 \
+  --set hubble.relay.enabled=true \
+  --set hubble.ui.enabled=true
+
+kubectl -n kube-system rollout status ds/cilium
+kubectl get nodes -o wide     # all 8 should now be Ready
+```
+
+Optional sanity check:
+
+```bash
+cilium status --wait
+cilium connectivity test        # takes ~10 min, worth it once
+```
+
+### 7.2 MetalLB
+
+```bash
+helm repo add metallb https://metallb.github.io/metallb
+helm install metallb metallb/metallb -n metallb-system --create-namespace
+kubectl -n metallb-system rollout status deploy/metallb-controller
+```
+
+`manifests/metallb-pool.yaml`:
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: poc-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 10.10.10.200-10.10.10.240
+---
+apiVersion: metallb.io/v1beta2
+kind: L2Advertisement
+metadata:
+  name: poc-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools: [poc-pool]
+```
+
+```bash
+kubectl apply -f manifests/metallb-pool.yaml
+```
+
+### 7.3 Storage — local-path
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml
+kubectl patch storageclass local-path \
+  -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+```
+
+For anything needing RWX, add the NFS CSI driver pointed at a Proxmox NFS export.
+
+### 7.4 Ingress
+
+```bash
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  -n ingress-nginx --create-namespace \
+  --set controller.service.type=LoadBalancer \
+  --set controller.replicaCount=2
+
+kubectl -n ingress-nginx get svc     # should get an IP from the MetalLB pool
+```
+
+### 7.5 Metrics server
+
+```bash
+helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+helm install metrics-server metrics-server/metrics-server -n kube-system \
+  --set 'args={--kubelet-insecure-tls}'
+```
+
+---
+
+## 8. Validation
+
+```bash
+# Topology
+kubectl get nodes -o wide
+kubectl get pods -A
+kubectl top nodes
+
+# etcd health
+kubectl -n kube-system exec -it etcd-k8s-cp-01 -- etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint status --write-out=table
+
+# Smoke test a LoadBalancer service
+kubectl create deploy web --image=nginx --replicas=5
+kubectl expose deploy web --port=80 --type=LoadBalancer
+kubectl get svc web -w
+curl http://<assigned-ip>
+
+# Label the workers properly
+for i in 1 2 3 4 5; do
+  kubectl label node k8s-wk-0$i node-role.kubernetes.io/worker=""
+done
+```
+
+### HA failure drills (the actual point of a PoC)
+
+```bash
+# 1. Kill a control plane — API should stay up via VIP failover
+qm stop 9011
+kubectl get nodes            # should still respond within ~5s
+
+# 2. Kill a second — quorum lost, API goes read-only/down. Expected.
+qm stop 9012
+qm start 9011 9012
+
+# 3. Drain a worker
+kubectl drain k8s-wk-03 --ignore-daemonsets --delete-emptydir-data
+kubectl uncordon k8s-wk-03
+```
+
+---
+
+## 9. Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Nodes stuck `NotReady` | No CNI installed | Install Cilium |
+| kubelet crashlooping, `failed to run Kubelet` | swap still on, or cgroup driver mismatch | `swapoff -a`; set `SystemdCgroup = true` |
+| `kubeadm join` times out on VIP | kube-vip static pod not running on CP-01 | `crictl ps -a \| grep vip`; check `/etc/kubernetes/manifests/kube-vip.yaml` |
+| VIP unreachable | ARP mode blocked by switch/firewall | Test with `arping 10.10.10.100`; switch to BGP mode if needed |
+| Terraform: `cloud-init drive not found` | `snippets` not enabled on datastore | `pvesm set local --content ...,snippets` |
+| Terraform hangs on `agent enabled` | qemu-guest-agent not installed in image | Confirm vendor cloud-config ran: `cloud-init status --long` |
+| MetalLB assigns IP, no traffic | Pool overlaps DHCP or another host | Pick a truly unused range |
+| etcd `apply entries took too long` | Slow disk | Move VM storage to NVMe |
+
+Useful one-liners:
+
+```bash
+journalctl -u kubelet -f --no-pager
+crictl ps -a
+crictl logs <container-id>
+kubeadm certs check-expiration
+cloud-init status --long && sudo cat /var/log/cloud-init-output.log
+```
+
+---
+
+## 10. Teardown
+
+```bash
+cd terraform
+terraform destroy -auto-approve
+```
+
+If a VM is locked:
+
+```bash
+qm unlock 9011
+qm stop 9011 && qm destroy 9011 --purge
+```
+
+---
+
+## 11. Known limitations of this PoC
+
+- **Single Proxmox host = single point of failure.** The 3-master HA is simulated; a host reboot takes the whole cluster. For a real HA test you need 3 Proxmox nodes with anti-affinity (HA groups).
+- No backup of etcd. Add `etcdctl snapshot save` on a cron before you trust it with anything.
+- Self-signed certs and `insecure = true` throughout.
+- `kubeadm` join tokens are short-lived; automate regeneration if you re-run Ansible later.
+- No secrets management — the API token lives in env vars. Move to Vault/SOPS before this pattern goes anywhere near prod.
+
+---
+
+## 12. Next steps if the PoC graduates
+
+1. Split across ≥3 Proxmox nodes; add HA groups and fencing.
+2. Replace the local `terraform.tfstate` with a remote backend (S3/GCS + locking).
+3. Swap kubeadm+Ansible for Cluster API with the CAPMOX provider — declarative node lifecycle, real rolling upgrades.
+4. Add etcd snapshot cron + off-cluster backup (Velero for workloads).
+5. Observability: kube-prometheus-stack + Loki; alert on etcd fsync latency and API server p99.
+6. Policy: Kyverno or Gatekeeper baseline, plus Cilium NetworkPolicies as default-deny.

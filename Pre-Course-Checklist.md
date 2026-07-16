@@ -92,6 +92,7 @@ The first `minikube start` downloads ~1 GB. Do it at home on good Wi-Fi:
 
 ```bash
 minikube start --driver=docker
+minikube start --driver=docker --cpus=1 --memory=1900mb --force # if on Cloud GCP
 kubectl get nodes        # NAME: minikube  STATUS: Ready
 minikube stop            # leave it stopped; Day 1 starts it again
 ```
